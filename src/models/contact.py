@@ -15,6 +15,7 @@ class Contact(Base):
     
     contact_id = Column(BigInteger, primary_key=True, index=True)
     staging_id = Column(BigInteger, ForeignKey("staging.staging_id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    contacts_user_id = Column(String, nullable=False, index=True)
     contact_email = Column(String, nullable=False, index=True)
     contact_first_name = Column(String, nullable=False)
     contact_last_name = Column(String, nullable=False)

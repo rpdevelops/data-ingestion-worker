@@ -55,7 +55,17 @@ class Processor:
         # Get job
         job = self.job_repo.get_by_id(self.db, job_id)
         if not job:
-            raise ValueError(f"Job {job_id} not found")
+            # Job not found - might have been deleted or message is stale
+            # Log warning but don't fail - just skip processing
+            logger.warning(
+                "Job not found - skipping processing",
+                extra={
+                    "job_id": job_id,
+                    "s3_key": s3_key,
+                    "note": "Job may have been deleted or message is stale"
+                }
+            )
+            return
         
         # Check if job is already COMPLETED - skip processing if so
         if job.job_status == JobStatus.COMPLETED:
@@ -115,9 +125,15 @@ class Processor:
             # Pre-processing: Normalize emails and identify duplicates within CSV
             duplicate_emails = self._identify_duplicate_emails(rows)
             
-            # Pre-load existing emails from contacts table
+            # Get user_id from job
+            job = self.job_repo.get_by_id(self.db, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            user_id = job.job_user_id
+            
+            # Pre-load existing emails from contacts table (filtered by user_id)
             all_emails = {RowValidator.normalize_email(row.get("email", "")) for row in rows if row.get("email")}
-            existing_emails = self.contact_repo.get_existing_emails(self.db, list(all_emails))
+            existing_emails = self.contact_repo.get_existing_emails(self.db, list(all_emails), user_id)
             
             logger.info(
                 "Pre-processing complete",
@@ -317,12 +333,18 @@ class Processor:
                 if staging.staging_status != discard_status
             ]
             
+            # Get user_id from job
+            job = self.job_repo.get_by_id(self.db, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            user_id = job.job_user_id
+            
             all_emails = {
                 RowValidator.normalize_email(staging.staging_email)
                 for staging in non_discard_records
                 if staging.staging_email
             }
-            existing_emails = self.contact_repo.get_existing_emails(self.db, list(all_emails))
+            existing_emails = self.contact_repo.get_existing_emails(self.db, list(all_emails), user_id)
             
             # Identify duplicate emails within staging records (excluding DISCARD)
             email_to_staging = {}
@@ -577,6 +599,12 @@ class Processor:
         )
         
         try:
+            # Get job to obtain user_id
+            job = self.job_repo.get_by_id(self.db, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            user_id = job.job_user_id
+            
             # Get staging records ready for consolidation
             ready_staging = self.staging_repo.get_ready_for_consolidation(self.db, job_id)
             
@@ -588,8 +616,8 @@ class Processor:
                 self.job_repo.update_status(self.db, job_id, JobStatus.COMPLETED)
                 return
             
-            # Batch create contacts from staging records
-            contacts = self.contact_repo.batch_create_from_staging(self.db, ready_staging)
+            # Batch create contacts from staging records (with user_id)
+            contacts = self.contact_repo.batch_create_from_staging(self.db, ready_staging, user_id)
             
             # Update staging records to SUCCESS
             for staging in ready_staging:
