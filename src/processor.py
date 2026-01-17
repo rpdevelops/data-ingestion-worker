@@ -3,6 +3,7 @@ Main processor for CSV files.
 Handles both initial processing and reprocessing flows.
 """
 from sqlalchemy.orm import Session
+from sqlalchemy import and_
 from datetime import datetime
 from typing import Dict, Set, List
 import csv
@@ -55,6 +56,17 @@ class Processor:
         job = self.job_repo.get_by_id(self.db, job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
+        
+        # Check if job is already COMPLETED - skip processing if so
+        if job.job_status == JobStatus.COMPLETED:
+            logger.info(
+                "Job is already COMPLETED - skipping processing",
+                extra={
+                    "job_id": job_id,
+                    "status": job.job_status.value
+                }
+            )
+            return
         
         # Check if job has staging records (reprocessing flow)
         has_staging = self.staging_repo.has_staging_records(self.db, job_id)
@@ -123,6 +135,23 @@ class Processor:
             
             for row_number, row_data in enumerate(rows, start=1):
                 try:
+                    # Log row data being processed (only first few rows for debugging)
+                    if row_number <= 3:
+                        logger.debug(
+                            "Processing row",
+                            extra={
+                                "job_id": job_id,
+                                "row_number": row_number,
+                                "row_data": row_data,
+                                "row_data_keys": list(row_data.keys()) if row_data else [],
+                                "row_data_values": list(row_data.values()) if row_data else [],
+                                "email": row_data.get("email") if row_data else None,
+                                "first_name": row_data.get("first_name") if row_data else None,
+                                "last_name": row_data.get("last_name") if row_data else None,
+                                "company": row_data.get("company") if row_data else None
+                            }
+                        )
+                    
                     # Generate row hash
                     row_hash = self.staging_repo.generate_row_hash(
                         job_id,
@@ -282,9 +311,10 @@ class Processor:
             
             # Pre-load existing emails from contacts table
             # Only consider non-DISCARD records for duplicate detection
+            discard_status = StagingStatus.DISCARD
             non_discard_records = [
                 staging for staging in staging_records
-                if staging.staging_status != StagingStatus.DISCARD
+                if staging.staging_status != discard_status
             ]
             
             all_emails = {
@@ -379,18 +409,16 @@ class Processor:
                         if issue.issue_resolved:
                             # Re-check if all staging records are still resolved
                             # This will automatically mark as unresolved if needed
-                            from src.models.staging import StagingStatus
-                            from src.models.issue_item import IssueItem
-                            
                             staging_ids = [
                                 item.item_staging_id 
                                 for item in issue.issue_items
                             ]
                             
+                            issue_status = StagingStatus.ISSUE
                             unresolved_count = self.db.query(Staging).filter(
                                 and_(
                                     Staging.staging_id.in_(staging_ids),
-                                    Staging.staging_status == StagingStatus.ISSUE
+                                    Staging.staging_status == issue_status
                                 )
                             ).count()
                             
@@ -484,7 +512,8 @@ class Processor:
     
     def _identify_duplicate_emails(self, rows: List[Dict]) -> Set[str]:
         """
-        Identify emails that appear multiple times in CSV with different identities.
+        Identify emails that appear multiple times in CSV.
+        Any email appearing more than once is considered a duplicate.
         
         Args:
             rows: List of row dictionaries
@@ -506,24 +535,32 @@ class Processor:
             
             email_to_rows[normalized].append(row)
         
-        # Find emails with multiple rows that have conflicting identities
+        # Find emails that appear multiple times (any occurrence > 1 is a duplicate)
         duplicate_emails = set()
         
         for email, email_rows in email_to_rows.items():
             if len(email_rows) > 1:
-                # Check if rows have different identities
-                identities = set()
-                for row in email_rows:
-                    identity = (
-                        row.get("first_name", "").strip(),
-                        row.get("last_name", "").strip(),
-                        row.get("company", "").strip()
-                    )
-                    identities.add(identity)
+                # Any email appearing more than once is a duplicate
+                # This includes both cases:
+                # - Same email with different identities (conflict to resolve)
+                # - Same email with same identity (error/redundancy to handle)
+                duplicate_emails.add(email)
                 
-                # If multiple different identities, it's a duplicate conflict
-                if len(identities) > 1:
-                    duplicate_emails.add(email)
+                logger.debug(
+                    "Duplicate email detected",
+                    extra={
+                        "email": email,
+                        "occurrence_count": len(email_rows),
+                        "rows": [
+                            {
+                                "first_name": row.get("first_name"),
+                                "last_name": row.get("last_name"),
+                                "company": row.get("company")
+                            }
+                            for row in email_rows
+                        ]
+                    }
+                )
         
         return duplicate_emails
     
