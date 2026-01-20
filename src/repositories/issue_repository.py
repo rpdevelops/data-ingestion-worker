@@ -128,6 +128,39 @@ class IssueRepository:
         return db.query(Issue).filter(Issue.issues_job_id == job_id).all()
     
     @staticmethod
+    def count_by_job_id(db: Session, job_id: int) -> int:
+        """
+        Count all issues for a job (resolved and unresolved).
+        
+        Args:
+            db: Database session
+            job_id: Job ID
+            
+        Returns:
+            Count of all issues
+        """
+        return db.query(Issue).filter(Issue.issues_job_id == job_id).count()
+    
+    @staticmethod
+    def count_unresolved_by_job_id(db: Session, job_id: int) -> int:
+        """
+        Count unresolved issues for a job.
+        
+        Args:
+            db: Database session
+            job_id: Job ID
+            
+        Returns:
+            Count of unresolved issues
+        """
+        return db.query(Issue).filter(
+            and_(
+                Issue.issues_job_id == job_id,
+                Issue.issue_resolved == False
+            )
+        ).count()
+    
+    @staticmethod
     def mark_as_resolved(
         db: Session,
         issue_id: int,

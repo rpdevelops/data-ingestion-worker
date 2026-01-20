@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Processing
     MAX_RETRIES: int = 3
     RETRY_DELAY_SECONDS: int = 5
+    PROGRESS_UPDATE_INTERVAL: int = 10  # Update job_processed_rows every N rows
     
     # Logging
     LOG_LEVEL: str = "INFO"

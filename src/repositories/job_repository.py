@@ -57,6 +57,8 @@ class JobRepository:
         job.job_status = status
         if process_start:
             job.job_process_start = process_start
+            # Clear process_end when starting a new processing cycle
+            job.job_process_end = None
         if process_end:
             job.job_process_end = process_end
         

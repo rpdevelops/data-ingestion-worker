@@ -19,6 +19,7 @@ from src.repositories.contact_repository import ContactRepository
 from src.validators.row_validator import RowValidator, ValidationResult
 from src.services.s3_service import s3_service
 from src.app.logging_config import get_logger
+from src.settings import settings
 
 logger = get_logger(__name__)
 
@@ -78,20 +79,46 @@ class Processor:
             )
             return
         
-        # Check if job has staging records (reprocessing flow)
+        # Determine processing flow based on job status and staging records
         has_staging = self.staging_repo.has_staging_records(self.db, job_id)
         
-        if has_staging:
+        # Decision logic:
+        # 1. If job status is NEEDS_REVIEW → User resolved issues, wants to reprocess staging → REPROCESSING
+        # 2. If job status is PROCESSING/PENDING and has staging → Worker restarted, needs to continue → INITIAL PROCESSING
+        # 3. If no staging → First time processing → INITIAL PROCESSING
+        
+        if has_staging and job.job_status == JobStatus.NEEDS_REVIEW:
+            # User resolved issues and triggered reprocessing - validate staging records
             logger.info(
-                "Job has existing staging records - routing to REPROCESSING flow",
-                extra={"job_id": job_id, "flow_type": "REPROCESSING"}
+                "Job has NEEDS_REVIEW status - routing to REPROCESSING flow",
+                extra={
+                    "job_id": job_id,
+                    "job_status": job.job_status.value,
+                    "flow_type": "REPROCESSING"
+                }
             )
             self._process_reprocessing(job_id)
         else:
-            logger.info(
-                "Job has no staging records - routing to INITIAL PROCESSING flow",
-                extra={"job_id": job_id, "flow_type": "INITIAL_PROCESSING"}
-            )
+            # Either first time processing or worker restart - process CSV from S3
+            if has_staging:
+                logger.info(
+                    "Job has staging but status is not NEEDS_REVIEW - routing to INITIAL PROCESSING flow (resume)",
+                    extra={
+                        "job_id": job_id,
+                        "job_status": job.job_status.value,
+                        "flow_type": "INITIAL_PROCESSING",
+                        "note": "Worker restarted or continuing interrupted processing"
+                    }
+                )
+            else:
+                logger.info(
+                    "Job has no staging records - routing to INITIAL PROCESSING flow",
+                    extra={
+                        "job_id": job_id,
+                        "job_status": job.job_status.value,
+                        "flow_type": "INITIAL_PROCESSING"
+                    }
+                )
             self._process_initial(job_id, s3_key)
     
     def _process_initial(self, job_id: int, s3_key: str) -> None:
@@ -146,8 +173,10 @@ class Processor:
             )
             
             # Process each row
-            processed_count = 0
+            processed_count = 0  # Count of newly processed rows (not skipped)
+            skipped_count = 0    # Count of rows already processed (via hash)
             issue_count = 0
+            progress_update_interval = settings.PROGRESS_UPDATE_INTERVAL
             
             for row_number, row_data in enumerate(rows, start=1):
                 try:
@@ -181,6 +210,28 @@ class Processor:
                             "Row already processed, skipping",
                             extra={"job_id": job_id, "row_number": row_number, "row_hash": row_hash}
                         )
+                        skipped_count += 1
+                        
+                        # Update progress even for skipped rows (to show total progress)
+                        if row_number % progress_update_interval == 0:
+                            total_seen = processed_count + skipped_count
+                            self.job_repo.update_metadata(
+                                self.db,
+                                job_id,
+                                processed_rows=total_seen
+                            )
+                            logger.debug(
+                                "Progress updated (with skipped)",
+                                extra={
+                                    "job_id": job_id,
+                                    "processed_rows": total_seen,
+                                    "new_rows": processed_count,
+                                    "skipped_rows": skipped_count,
+                                    "total_rows": len(rows),
+                                    "progress_percent": round((total_seen / len(rows)) * 100, 2) if rows else 0
+                                }
+                            )
+                        
                         continue
                     
                     # Create staging record
@@ -226,6 +277,26 @@ class Processor:
                     
                     processed_count += 1
                     
+                    # Update progress periodically (using row_number to include skipped rows)
+                    if row_number % progress_update_interval == 0:
+                        total_seen = processed_count + skipped_count
+                        self.job_repo.update_metadata(
+                            self.db,
+                            job_id,
+                            processed_rows=total_seen
+                        )
+                        logger.debug(
+                            "Progress updated",
+                            extra={
+                                "job_id": job_id,
+                                "processed_rows": total_seen,
+                                "new_rows": processed_count,
+                                "skipped_rows": skipped_count,
+                                "total_rows": len(rows),
+                                "progress_percent": round((total_seen / len(rows)) * 100, 2) if rows else 0
+                            }
+                        )
+                    
                 except Exception as e:
                     logger.error(
                         "Error processing row",
@@ -239,17 +310,40 @@ class Processor:
                     # Continue processing other rows
                     continue
             
-            # Update job metadata
+            # Update job metadata - use total rows from CSV for processed_rows
+            # This ensures the count is accurate even with restarts and skipped rows
+            total_rows = len(rows)
+            
+            # Count unresolved issues (not all issues, not staging records with ISSUE)
+            # An issue can affect multiple staging records (e.g., duplicate emails)
+            # Only count issues that are not resolved (issue_resolved = false)
+            # This ensures accurate issue count even after worker restart
+            total_issues = self.issue_repo.count_by_job_id(self.db, job_id)
+            unresolved_issues = self.issue_repo.count_unresolved_by_job_id(self.db, job_id)
+            
             self.job_repo.update_metadata(
                 self.db,
                 job_id,
-                total_rows=len(rows),
-                processed_rows=processed_count,
-                issue_count=issue_count
+                total_rows=total_rows,
+                processed_rows=total_rows,  # All rows from CSV have been seen
+                issue_count=unresolved_issues  # Count only unresolved issues
             )
             
-            # Post-processing decision
-            if issue_count > 0:
+            logger.info(
+                "Processing statistics",
+                extra={
+                    "job_id": job_id,
+                    "total_rows": total_rows,
+                    "new_rows": processed_count,
+                    "skipped_rows": skipped_count,
+                    "new_issues_this_run": issue_count,
+                    "total_issues": total_issues,
+                    "unresolved_issues": unresolved_issues
+                }
+            )
+            
+            # Post-processing decision - use unresolved issues count
+            if unresolved_issues > 0:
                 # Has issues - set status to NEEDS_REVIEW
                 self.job_repo.update_status(
                     self.db,
@@ -261,9 +355,12 @@ class Processor:
                     "Job processing complete - needs review",
                     extra={
                         "job_id": job_id,
-                        "total_rows": len(rows),
-                        "processed_rows": processed_count,
-                        "issue_count": issue_count,
+                        "total_rows": total_rows,
+                        "new_rows": processed_count,
+                        "skipped_rows": skipped_count,
+                        "new_issues_this_run": issue_count,
+                        "total_issues": total_issues,
+                        "unresolved_issues": unresolved_issues,
                         "flow_type": "INITIAL_PROCESSING"
                     }
                 )
@@ -273,8 +370,9 @@ class Processor:
                     "Job processing complete - no issues, proceeding to consolidation",
                     extra={
                         "job_id": job_id,
-                        "total_rows": len(rows),
-                        "processed_rows": processed_count,
+                        "total_rows": total_rows,
+                        "new_rows": processed_count,
+                        "skipped_rows": skipped_count,
                         "flow_type": "INITIAL_PROCESSING"
                     }
                 )
@@ -365,6 +463,8 @@ class Processor:
             issue_count = 0
             ready_count = 0
             discard_count = 0
+            progress_update_interval = settings.PROGRESS_UPDATE_INTERVAL
+            total_staging_records = len(staging_records)
             
             for staging in staging_records:
                 # Skip records already marked as DISCARD (user decision)
@@ -468,6 +568,23 @@ class Processor:
                     
                     processed_count += 1
                     
+                    # Update progress periodically
+                    if processed_count % progress_update_interval == 0:
+                        self.job_repo.update_metadata(
+                            self.db,
+                            job_id,
+                            processed_rows=processed_count
+                        )
+                        logger.debug(
+                            "Progress updated (reprocessing)",
+                            extra={
+                                "job_id": job_id,
+                                "processed_rows": processed_count,
+                                "total_staging_records": total_staging_records,
+                                "progress_percent": round((processed_count / total_staging_records) * 100, 2) if total_staging_records > 0 else 0
+                            }
+                        )
+                    
                 except Exception as e:
                     logger.error(
                         "Error reprocessing staging record",
@@ -481,16 +598,36 @@ class Processor:
                     # Continue processing other records
                     continue
             
+            # Count unresolved issues (not all issues, not staging records with ISSUE)
+            # An issue can affect multiple staging records (e.g., duplicate emails)
+            # Only count issues that are not resolved (issue_resolved = false)
+            # This ensures accurate issue count even after worker restart
+            total_issues = self.issue_repo.count_by_job_id(self.db, job_id)
+            unresolved_issues = self.issue_repo.count_unresolved_by_job_id(self.db, job_id)
+            
             # Update job metadata
             self.job_repo.update_metadata(
                 self.db,
                 job_id,
                 processed_rows=processed_count,
-                issue_count=issue_count
+                issue_count=unresolved_issues  # Count only unresolved issues
             )
             
-            # Post-processing decision
-            if issue_count > 0:
+            logger.info(
+                "Reprocessing statistics",
+                extra={
+                    "job_id": job_id,
+                    "processed_rows": processed_count,
+                    "ready_count": ready_count,
+                    "discard_count": discard_count,
+                    "new_issues_this_run": issue_count,
+                    "total_issues": total_issues,
+                    "unresolved_issues": unresolved_issues
+                }
+            )
+            
+            # Post-processing decision - use unresolved issues count
+            if unresolved_issues > 0:
                 # Has issues - set status to NEEDS_REVIEW
                 self.job_repo.update_status(
                     self.db,
@@ -504,7 +641,9 @@ class Processor:
                         "job_id": job_id,
                         "processed_rows": processed_count,
                         "ready_count": ready_count,
-                        "issue_count": issue_count,
+                        "new_issues_this_run": issue_count,
+                        "total_issues": total_issues,
+                        "unresolved_issues": unresolved_issues,
                         "discard_count": discard_count,
                         "flow_type": "REPROCESSING"
                     }
