@@ -2,76 +2,44 @@
 
 Asynchronous worker service for processing CSV file imports.
 
+> **Main Documentation**: See [data-ingestion-tool](https://github.com/rpdevelops/data-ingestion-tool) for architecture overview and system flow.
+
+---
+
 ## Overview
 
-The worker consumes messages from AWS SQS queue and processes CSV files stored in S3. It handles both initial processing and reprocessing flows:
+The worker consumes messages from AWS SQS and processes CSV files stored in S3. It handles:
 
-- **Initial Processing**: First time processing a CSV file - reads from S3, validates rows, creates staging records
-- **Reprocessing**: When user resolves issues and triggers reprocessing - validates existing staging records without re-reading CSV
+- **Initial Processing**: First-time CSV processing with row validation
+- **Reprocessing**: Re-validation after user resolves issues
 
-## Key Features
+---
 
-- **Idempotent Processing**: Uses row hashes to prevent duplicate processing
-- **Restart-Safe**: Worker can be safely restarted - resumes from where it stopped
-- **Dual Flow Support**: Same processor handles both initial and reprocessing
-- **Progress Tracking**: Updates `job_processed_rows` periodically during processing
-- **Issue Management**: Counts only unresolved issues for decision making
-- **User Isolation**: Each user's contacts isolated via `contacts_user_id`
-- **CSV Handling**: Multiple encoding support and automatic delimiter detection
+## Quick Start
 
-## Processing Flows
+### Prerequisites
 
-### Routing Decision Logic
+- Python 3.11+
+- AWS credentials configured
+- Environment variables set
 
-The worker determines which flow to use based on job status and staging records:
+### Run Locally
 
-1. **Job status = COMPLETED** → Skip processing (job already finalized)
-2. **Job status = NEEDS_REVIEW + has staging** → REPROCESSING flow (user resolved issues)
-3. **Job status = PROCESSING/PENDING + has staging** → INITIAL PROCESSING flow (resume after restart)
-4. **No staging records** → INITIAL PROCESSING flow (first time processing)
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
 
-### Initial Processing Flow
+### Docker
 
-1. Read CSV file from S3 (with encoding/delimiter detection)
-2. Pre-process: identify duplicate emails within CSV
-3. Pre-load existing emails from contacts table (filtered by user_id)
-4. For each row:
-   - Generate deterministic row hash
-   - Check idempotency (skip if already processed via hash)
-   - Create staging record
-   - Validate row
-   - Create issues if validation fails
-   - Mark staging as READY if valid
-   - Update progress periodically (every N rows)
-5. Count unresolved issues
-6. If unresolved issues found → set job status to NEEDS_REVIEW
-7. If no unresolved issues → proceed to consolidation
+```bash
+docker build -t data-ingestion-worker .
+docker run --env-file .env data-ingestion-worker
+```
 
-### Reprocessing Flow
-
-1. Get all staging records for job
-2. Pre-load existing emails from contacts table (filtered by user_id)
-3. Identify duplicate emails within staging records (excluding DISCARD)
-4. For each staging record:
-   - Skip if status is DISCARD (user decision)
-   - Validate using staging record data (no CSV read)
-   - Update status: READY if valid, ISSUE if invalid
-   - Mark issues as resolved if all related staging records are resolved
-   - Mark issues as unresolved if new problems appear
-   - Update progress periodically (every N rows)
-5. Count unresolved issues
-6. If unresolved issues found → set job status to NEEDS_REVIEW
-7. If no unresolved issues → proceed to consolidation
-
-### Consolidation Phase
-
-Consolidates staging records with READY status to the contacts table:
-
-1. Get all staging records with READY status
-2. Batch create contacts from staging records (with user_id from job)
-3. Update staging records to SUCCESS
-4. Update job status to COMPLETED
-5. All operations are atomic (transaction)
+---
 
 ## Environment Variables
 
@@ -85,211 +53,183 @@ AWS_REGION=us-east-1
 
 # AWS SQS
 SQS_QUEUE_URL=https://sqs.region.amazonaws.com/account/queue-name
-SQS_MAX_NUMBER_OF_MESSAGES=1
-SQS_WAIT_TIME_SECONDS=20
-SQS_VISIBILITY_TIMEOUT=300  # 5 minutes - message stays invisible while being processed
+SQS_VISIBILITY_TIMEOUT=300
 
 # Processing
-MAX_RETRIES=3
-RETRY_DELAY_SECONDS=5
-PROGRESS_UPDATE_INTERVAL=10  # Update job_processed_rows every N rows
+PROGRESS_UPDATE_INTERVAL=10
 
 # Logging
 LOG_LEVEL=INFO
 LOG_FORMAT=json
 ```
 
-## Running Locally
+---
 
-### Prerequisites
+## Processing Flows
 
-- Python 3.11+
-- PostgreSQL database (AWS RDS)
-- AWS S3 bucket configured
-- AWS SQS queue configured
+### Routing Decision
 
-### Installation
+| Condition | Flow |
+|-----------|------|
+| Status = COMPLETED | Skip (already finalized) |
+| Status = NEEDS_REVIEW + has staging | Reprocessing |
+| Status = PROCESSING/PENDING + has staging | Resume initial processing |
+| No staging records | Initial processing |
 
-1. Create virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+### Initial Processing
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+1. Download CSV from S3
+2. Detect encoding and delimiter
+3. Identify duplicate emails within CSV
+4. Pre-load existing contacts for email validation
+5. For each row:
+   - Generate deterministic row hash
+   - Skip if already processed (idempotency)
+   - Create staging record
+   - Validate row
+   - Create issues if validation fails
+6. Set job status based on issue count
 
-3. Set environment variables (create `.env` file)
+### Reprocessing
 
-4. Run the worker:
-```bash
-python main.py
-```
+1. Load existing staging records
+2. Skip DISCARD rows (user decision)
+3. Re-validate remaining rows
+4. Update issue resolution status
+5. Proceed to consolidation if no issues
 
-## Docker
+### Consolidation
 
-Build and run:
-```bash
-docker build -t data-ingestion-worker .
-docker run --env-file .env data-ingestion-worker
-```
+Atomic transaction:
+1. Insert READY staging rows into contacts
+2. Update staging status to SUCCESS
+3. Set job status to COMPLETED
 
-## Important Notes
-
-### Worker Restart and SQS Visibility Timeout
-
-When the worker is restarted while processing a job:
-- The previous message may still be invisible in SQS (visibility timeout = 300s = 5 minutes)
-- The worker will wait until the message becomes visible again (up to 5 minutes delay)
-- Once visible, the worker resumes processing from where it stopped
-- Row hashes ensure no duplicate processing occurs
-
-**To reduce restart delay in development:** Set `SQS_VISIBILITY_TIMEOUT=60`
-
-### Progress Tracking
-
-The worker updates `job_processed_rows` every N rows (configurable via `PROGRESS_UPDATE_INTERVAL`):
-- Includes both new rows processed and skipped rows (already processed in previous run)
-- After completion, `job_processed_rows` = `job_total_rows` (all CSV rows accounted for)
-
-### Issue Counting
-
-The worker counts **unresolved issues** (`issue_resolved = false`) for decision making:
-- `job_issue_count` = number of unresolved issues
-- If `unresolved_issues > 0` → status set to NEEDS_REVIEW
-- If `unresolved_issues = 0` → proceeds to consolidation
-- Resolved issues are kept in database for history but don't block consolidation
-
-### CSV Handling
-
-**Multiple encoding support** (tried in order):
-- utf-8, latin-1, cp1252, iso-8859-1, windows-1252
-
-**Automatic delimiter detection** (tried in order):
-- Semicolon (`;`) - Common in European/Portuguese CSVs (prioritized)
-- Comma (`,`) - Standard CSV format
-- Tab (`\t`) - TSV format
-
-The first combination that produces valid results (multiple fields with valid field names) is used. Empty fields from trailing delimiters are automatically cleaned.
-
-### User Isolation
-
-- Email validation checks only emails from the same user (`contacts_user_id`)
-- Same email can exist for different users
-- Prevents cross-user data leakage
+---
 
 ## Validation Rules
 
-The worker validates rows according to:
+| Order | Validation | Issue Type |
+|-------|------------|------------|
+| 1 | Required fields present | MISSING_REQUIRED_FIELD |
+| 2 | Email format valid | INVALID_EMAIL |
+| 3 | Email not duplicate in CSV | DUPLICATE_EMAIL |
+| 4 | Email not in existing contacts | EXISTING_EMAIL |
 
-1. **Required Fields**: email, first_name, last_name, company must be present
-2. **Email Format**: Valid email format (RFC 5322 compliant)
-3. **Duplicate Email**: Same email appears multiple times in CSV (any occurrence > 1)
-4. **Existing Email**: Email already exists in contacts table for the same user
+---
 
-## Status Flow
+## CSV Handling
 
-**Job status transitions:**
-- `PENDING` → `PROCESSING` → `NEEDS_REVIEW` (if unresolved issues) or `COMPLETED` (if no unresolved issues)
-- `PENDING` → `PROCESSING` → `FAILED` (on error)
-- `NEEDS_REVIEW` → `PROCESSING` (reprocessing) → `NEEDS_REVIEW` (if still has unresolved issues) or `COMPLETED` (if all resolved)
+**Encodings** (tried in order):
+- UTF-8, Latin-1, CP1252, ISO-8859-1, Windows-1252
 
-**Staging status values:**
-- `READY`: Valid and ready for consolidation
-- `ISSUE`: Has validation issues
-- `DISCARD`: User decided to discard (skipped in reprocessing)
-- `SUCCESS`: Successfully consolidated to contacts
+**Delimiters** (tried in order):
+- Semicolon (`;`), Comma (`,`), Tab (`\t`)
 
-**Issue resolution:**
-- `issue_resolved = false`: Issue needs user attention
-- `issue_resolved = true`: Issue resolved, kept in database for history
-- Only unresolved issues count toward `job_issue_count`
+---
 
-## Database Models
+## Idempotency
 
-- `Job`: Job lifecycle and metadata
-- `Staging`: Imported rows before finalization (includes `staging_row_hash` for idempotency)
-- `Issue`: Validation issues requiring user input (includes `issue_resolved` flag)
-- `IssueItem`: Links issues to staging records (many-to-many)
-- `Contact`: Finalized contact records (includes `contacts_user_id` for user isolation)
+- **Row Hash**: `hash(job_id, row_number, row_content)`
+- **Database Constraint**: `UNIQUE (staging_job_id, staging_row_hash)`
+- **Safe Retries**: Worker can restart without duplicate processing
 
+---
 
-## Logging
+## Architectural Decision Records (ADRs)
 
-The worker uses structured JSON logging compatible with CloudWatch Logs. Logs include:
-- Flow type (INITIAL_PROCESSING or REPROCESSING)
-- Job ID and processing statistics
-- Issue statistics (new_issues_this_run, total_issues, unresolved_issues)
-- Progress updates with percentages
-- Error details
+### ADR-001: Row Hashes for Idempotency
 
-## Error Handling
+**Decision**: Use deterministic hashes instead of sequential IDs.
 
-- Jobs that fail are marked with status `FAILED`
-- Failed messages remain in SQS queue for retry (until DLQ after max retries)
-- Worker logs detailed error information for debugging
-- Job not found: logs warning and skips (message deleted from queue)
+**Rationale**:
+- Enables safe restarts and retries
+- Database constraint enforces uniqueness
+- No duplicate processing on worker crash
 
-## Design Decisions
+---
 
-### Why Row Hashes for Idempotency?
+### ADR-002: Count Unresolved Issues Only
 
-Deterministic hash based on job_id, row_number, and row content allows safe restarts without duplicate processing. Database constraint enforces uniqueness.
+**Decision**: `job_issue_count` counts only unresolved issues.
 
-### Why Count Unresolved Issues Instead of All Issues?
+**Rationale**:
+- Resolved issues should not block consolidation
+- History preserved for auditing
+- Clear separation: current problems vs historical
 
-Resolved issues should not block consolidation. History of resolved issues is valuable for auditing. Clear separation between current problems and historical issues.
+---
 
-### Why Reprocess Staging Instead of Re-reading CSV?
+### ADR-003: Reprocess from Staging
 
-Faster processing (no S3 download needed). User may have corrected data in staging directly. Respects user's decisions (DISCARD status). Validates current state, not original CSV.
+**Decision**: Reprocessing uses staging records, not CSV re-read.
 
-### Why Multiple Encoding Support?
+**Rationale**:
+- Faster (no S3 download)
+- Respects user edits to staging data
+- Honors DISCARD decisions
 
-CSV files come from various sources with different encodings. Portuguese/Brazilian systems often use latin-1 or cp1252. Automatic detection prevents "empty fields" errors.
+---
 
-### Why Semicolon Delimiter Priority?
+### ADR-004: Semicolon Delimiter Priority
 
-Common in European/Portuguese CSV exports. Excel exports often use semicolon for Portuguese locale. Detecting it first improves user experience.
+**Decision**: Try semicolon before comma.
 
-### Why Progress Updates During Processing?
+**Rationale**:
+- Common in European/Portuguese CSV exports
+- Excel uses semicolon for non-English locales
 
-Users can track long-running jobs in real-time. Helps with UX and user confidence. Allows frontend to show progress bars.
+---
 
-### Why User Isolation in Contacts?
+### ADR-005: User Isolation
 
-Multi-tenant architecture requirement. Same email can be valid for different users/organizations. Prevents cross-user data leakage.
+**Decision**: Filter contacts by `contacts_user_id`.
 
-## Case Studies & Fixes
+**Rationale**:
+- Multi-tenant architecture
+- Same email valid for different users
+- Prevents cross-user data leakage
 
-### Worker Restart During Processing
+---
 
-**Problem**: Worker stopped mid-processing (32/100 rows). After restart, only processed 32 staging records and marked job as COMPLETED.
+## Troubleshooting
 
-**Solution**: Implemented status-based routing - `PROCESSING/PENDING` + staging → continue INITIAL PROCESSING (read CSV, skip processed via hash). Hash-based idempotency ensures skipped rows are not reprocessed.
+### Worker Restart Delay
 
-### Incorrect Progress Count After Restart
+**Symptom**: Worker waits up to 5 minutes after restart.
 
-**Problem**: `job_processed_rows` showed 70/100 (only counted new rows, not skipped ones).
+**Cause**: SQS visibility timeout (message still invisible).
 
-**Solution**: Added `skipped_count` tracking. Progress updates use `processed_count + skipped_count`. Final update uses `len(rows)` to ensure accuracy.
+**Solution**: Reduce `SQS_VISIBILITY_TIMEOUT` for development.
 
-### Incorrect Issue Count
+### Incorrect Progress Count
 
-**Problem**: `job_issue_count` counted staging records with ISSUE (or all issues including resolved ones) instead of unresolved issues.
+**Symptom**: Progress shows fewer rows than total.
 
-**Solution**: Count issues from `issues` table, filtering by `issue_resolved = false`. An issue can affect multiple staging records (e.g., duplicate emails).
+**Cause**: Only counting new rows, not skipped.
 
-### CSV Importing with Null Fields
+**Solution**: Fixed - progress includes skipped rows.
 
-**Problem**: CSV with semicolon delimiter was importing all fields as null.
+### CSV Fields Null
 
-**Solution**: Automatic delimiter detection (tries `;`, `,`, `\t` in order). Validates delimiter produces multiple fields with valid field names. Cleans empty fields from trailing delimiters.
+**Symptom**: All fields imported as null.
 
+**Cause**: Wrong delimiter detection.
 
-## Known Limitations
+**Solution**: Fixed - automatic delimiter detection with validation.
 
-- CSV file size limited by memory (not streaming)
-- No parallel processing of rows (sequential for simplicity)
+---
+
+## Limitations
+
+- CSV loaded into memory (not streaming)
+- Sequential row processing (no parallelism)
+
+---
+
+## Related Repositories
+
+- [data-ingestion-tool](https://github.com/rpdevelops/data-ingestion-tool) - Main documentation
+- [data-ingestion-backend](https://github.com/rpdevelops/data-ingestion-backend) - FastAPI API
+- [data-ingestion-frontend](https://github.com/rpdevelops/data-ingestion-frontend) - Next.js UI
+- [data-ingestion-infra](https://github.com/rpdevelops/data-ingestion-infra) - Terraform IaC
